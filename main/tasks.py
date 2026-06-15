@@ -1,7 +1,7 @@
 import sys
 import os
 import json
-import time
+import asyncio
 import urllib.request
 import urllib.error
 from io import StringIO
@@ -60,7 +60,7 @@ async def execute_user_code_async(code, channel_name):
 async def generate_ai_response_async(action, code, channel_name):
     """
     Sends contextual prompt configurations to Google Gemini 2.5 Flash.
-    Features robust error fallback layers and exponential backoff retry cycles.
+    Now utilizes fully non-blocking asynchronous sleep calls and fail-fast rate-limiting logic.
     """
     channel_layer = get_channel_layer()
     
@@ -108,9 +108,11 @@ Your python script has been verified against syntax standard frameworks. No imme
         # Build stable production REST API request routing directly to the Gemini 2.5 Flash model
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
         
+        # System instructions to keep outputs structured, clean, and screenshot-friendly
         system_instruction = (
-            "You are an expert AI software companion. Provide clear, professional, markdown-formatted answers. "
-            "For refactoring, provide clean optimized code snippets. For explaining, break it down clearly and step-by-step."
+            "You are an expert AI software companion. Provide crisp, professional, highly concise markdown answers. "
+            "Your entire response MUST fit completely on a single screen without vertical scrolling. "
+            "For refactoring, provide only the core optimized function and a short 3-bullet-point optimization summary."
         )
         
         payload = {
@@ -137,47 +139,66 @@ Your python script has been verified against syntax standard frameworks. No imme
                     headers={"Content-Type": "application/json"},
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=15) as response:
+                with urllib.request.urlopen(req, timeout=30) as response:
                     res_data = json.loads(response.read().decode("utf-8"))
-                    ai_output = res_data['candidates'][0]['content']['parts'][0]['text']
-                    success = True
-                    break
+                    
+                    # Safe dictionary parsing to avoid IndexError / KeyError loop freezes
+                    candidates = res_data.get('candidates', [])
+                    if candidates:
+                        content = candidates[0].get('content', {})
+                        parts = content.get('parts', [])
+                        if parts:
+                            ai_output = parts[0].get('text', '')
+                            print("✅ Gemini content parsed successfully!")
+                            break
+                        else:
+                            ai_output = "### ❌ AI Parsing Error\nGoogle returned empty payload components."
+                    else:
+                        error_info = res_data.get('error', {})
+                        ai_output = f"### ❌ Gemini API Error\n{error_info.get('message', 'Unknown API structure returned.')}"
+                    break # Break immediately if parsing structure failed (no need to retry)
+                    
             except urllib.error.HTTPError as e:
-                # Catch unauthorized errors cleanly
-                if e.code == 401:
+                # INSTANT FAILURE: Do not retry client configuration errors or rate limits (429)
+                if e.code == 429:
                     ai_output = (
-                        "### ❌ AI Engine Error: 401 Unauthorized\n\n"
-                        "The Google Gemini API rejected your key. This usually happens for one of these reasons:\n\n"
-                        "1. **Incorrect Key Value**: Double-check that your API Key is copied perfectly. "
-                        "The standard free key created in Google AI Studio typically starts with **`AIzaSy...`**.\n"
-                        "2. **Trailing Characters**: Make sure there are no accidental spaces, newlines, or quote marks "
-                        "around the key inside your configuration or terminal shell environment.\n"
-                        "3. **Active Shell Environment**: If you set the key via PowerShell, make sure your server is running "
-                        "in the *same* terminal window where you executed `$env:GEMINI_API_KEY='your_key'`. If you closed or reopened "
-                        "the terminal, you must set the environment variable again, or paste it directly into your `editor/settings.py`."
+                        "### ⏳ Quota Rate Limit Exceeded (429)\n\n"
+                        "You have exceeded your free tier limit of **15 requests per minute** or **1,500 requests per day**.\n\n"
+                        "**Immediate Action Needed:**\n"
+                        "1. Wait 15–30 seconds for the current window to reset.\n"
+                        "2. Once the countdown timer on your button finishes, try clicking again!"
                     )
+                    print(f"❌ Gemini Connection Rate Limited (429). Fast-failing task immediately.")
+                    break
+                elif 400 <= e.code < 500:
+                    try:
+                        error_details = json.loads(e.read().decode("utf-8"))
+                        error_msg = error_details.get('error', {}).get('message', 'Client configuration error.')
+                    except Exception:
+                        error_msg = e.reason
+                    
+                    print(f"❌ Gemini Connection Client Error ({e.code}): {error_msg}")
+                    ai_output = f"### ❌ Gemini API Client Error ({e.code})\n\n{error_msg}"
                     break
                 
-                # Handle other HTTP errors gracefully
+                # Server/Quota Errors retry cycles
                 if i == len(delays) - 1:
-                    try:
-                        error_message = e.read().decode("utf-8")
-                        ai_output = f"AI Engine Connection Error ({e.code}): {error_message}"
-                    except Exception:
-                        ai_output = f"AI Engine Connection Error ({e.code}): {e.reason}"
+                    ai_output = f"### ❌ Gemini API Connection Timeout\nServer is currently experiencing latency."
                 else:
-                    time.sleep(delay)
+                    print(f"⚠️ Gateway Latency. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
             except Exception as e:
                 if i == len(delays) - 1:
-                    ai_output = f"AI Engine Connection Error: Unable to complete request with Gemini. Details: {str(e)}"
+                    ai_output = f"### ❌ Connection Error\n{str(e)}"
                 else:
-                    time.sleep(delay)
+                    print(f"⚠️ Exception hit. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
                     
-    # 4. Stream response back to user's screen interface console
+    # 4. Stream response back to user's screen interface console using the "ai_result" event type
     await channel_layer.send(
         channel_name,
         {
-            "type": "code_result",
+            "type": "ai_result",
             "output": ai_output
         }
     )

@@ -135,4 +135,4 @@ CELERY_RESULT_EXTENDED = True
 # ==============================================================================
 # Your active API key is configured below as the default system key.
 # ==============================================================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LGgkYWAR4eua2tQMFBSYuo8gq1Df1LFK20IyENnfpr1g")
+genai.configure(api_key="YOUR_GEMINI_API_KEY_HERE")
